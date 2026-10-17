@@ -36,13 +36,23 @@ def _fix_suggestions(result: ScanResult) -> list[str]:
     except OSError:
         here = False
     at = "" if here else f" --path {shlex.quote(result.root)}"
-    blocking = [f for f in result.blocking]
+    prod = sorted({f.path for f in result.findings if f.unresolvable})
+    blocking = [f for f in result.blocking if f.path not in prod]
     files = sorted({f.path for f in blocking if f.category != "config"})
     ids = [f.short_id for f in blocking]
     shown_ids = " ".join(ids[:8]) + (" …" if len(ids) > 8 else "")
     quoted = " ".join(shlex.quote(p) for p in files[:8]) + (" …" if len(files) > 8 else "")
     agent = result.agent
-    out = ["", "How to resolve, without deleting anything (pick one per file):", ""]
+    out = [""]
+    if prod:
+        out += ["Production files always block: protecting or allowing them is not an option.",
+                "  Remove them from the repo (keep them in your secret store / deployment system):"]
+        out += [f"    {p}" for p in prod]
+        out += ["  If a file was committed, it stays in git history and on any remote it was pushed to:",
+                "  rotate the values it contains.", ""]
+    if not blocking:
+        return out
+    out += ["How to resolve the other findings, without deleting anything (pick one per file):", ""]
     out.append("  1. Keep it away from the agent: the file stays, the agent can't read it, prescan stops blocking.")
     if agent in PROTECTABLE:
         out.append(f"       {cmd} protect {quoted} --agent {agent}{at}")

@@ -37,7 +37,7 @@ _K8S_KIND = re.compile(r"(?m)^kind:[ \t]*\w+")
 _PROD_PATH = re.compile(r"(?:^|[/._\-])(?:prod|production|prd|live)(?:[/._\-]|$)", re.IGNORECASE)
 _PROD_TEXT = re.compile(
     r"(?im)^[ \t]*-?[ \t]*(?:environment|env|stage|deploy_env|deployment_environment|ENVIRONMENT|ASPNETCORE_ENVIRONMENT"
-    r"|NODE_ENV|SPRING_PROFILES_ACTIVE)[ \t]*[:=][ \t]*[\"']?(?:prod|production|prd)\b"
+    r"|NODE_ENV|SPRING_PROFILES_ACTIVE)[ \t]*[:=][ \t]*[\"']?(?:prod|production|prd|pro)\b"
 )
 
 
@@ -74,6 +74,62 @@ def classify(rel: str, text: str) -> frozenset[str]:
     if fnmatch.fnmatchcase(lname, "docker-compose*.y*ml") or fnmatch.fnmatchcase(lname, "compose*.y*ml"):
         c.add("compose")
     return frozenset(c)
+
+
+# --------------------------------------------------------------------------- #
+# Production files: anything whose path says "production" always blocks
+# --------------------------------------------------------------------------- #
+_PROD = r"(?:prod|production|prd)"
+_PROD_IN_NAME = re.compile(r"(?:^|[._\-])" + _PROD + r"(?:[._\-]|$)", re.IGNORECASE)
+_PROD_DIR = re.compile(r"^" + _PROD + r"(?:[._\-].*)?$|^.*[._\-]" + _PROD + r"$", re.IGNORECASE)
+_PROD_ENV = re.compile(r"^\.env[._\-]" + _PROD + r"(?:[._\-].*)?$|^(?:.*[._\-])?" + _PROD + r"\.env$",
+                       re.IGNORECASE)
+# "pro" is also used for production, but just as often for a pricing tier or a Qt project file:
+# these are *possible* production files, which block but can be marked safe with `prescan allow`.
+_PRO = r"pro"
+_PRO_IN_NAME = re.compile(r"(?:^|[._\-])" + _PRO + r"(?:[._\-]|$)", re.IGNORECASE)
+_PRO_DIR = re.compile(r"^" + _PRO + r"(?:[._\-].*)?$|^.*[._\-]" + _PRO + r"$", re.IGNORECASE)
+_PRO_ENV = re.compile(r"^\.env[._\-]" + _PRO + r"(?:[._\-].*)?$|^(?:.*[._\-])?" + _PRO + r"\.env$", re.IGNORECASE)
+_CONFIG_EXT = {".yaml", ".yml", ".json", ".jsonc", ".json5", ".toml", ".ini", ".cfg", ".conf", ".properties",
+               ".env", ".tfvars", ".tf", ".hcl", ".xml", ".sh", ".bash", ".zsh", ".ps1", ".kubeconfig", ".tpl"}
+_CODE_EXT = {".py", ".rb", ".js", ".mjs", ".cjs", ".ts", ".php", ".groovy", ".gradle", ".kts", ".ex", ".exs"}
+_INFRA_NAMES = ("dockerfile", "containerfile", "jenkinsfile", "kubeconfig", "vagrantfile", "makefile")
+_TEMPLATE_WORDS = {"example", "examples", "sample", "template", "templates", "dist", "defaults", "tpl"}
+
+
+def production_kind(rel: str) -> str | None:
+    """"env" / "config" for production files (always block), "possible" for files that may be
+    production (block, but can be marked safe), else None. Case-insensitive.
+
+    Decided by path only, so it's predictable: a `prod` / `production` / `prd` word in the file
+    name, as its extension (`values.prod`) or in a parent directory, on config/infra/script files.
+    The same with `pro` gives "possible". Templates, examples and documentation don't count.
+    """
+    parts = rel.split("/")
+    name = parts[-1]
+    lname = name.lower()
+    words = set(re.split(r"[._\-]", lname))
+    if words & _TEMPLATE_WORDS or any(d.lower() in ("example", "examples", "sample", "samples") for d in parts[:-1]):
+        return None
+    if _PROD_ENV.match(name):
+        return "env"
+    stem, ext = (lname.rsplit(".", 1)[0], "." + lname.rsplit(".", 1)[1]) if "." in lname.lstrip(".") else (lname, "")
+    if ext in (".prod", ".production", ".prd"):          # values.prod, config.PRD
+        return "config"
+    dirs = [d for d in parts[:-1] if d.lower() not in _TEMPLATE_WORDS]
+    config_like = ext in _CONFIG_EXT or lname.startswith(_INFRA_NAMES)
+    if config_like and (_PROD_IN_NAME.search(lname) or any(_PROD_DIR.match(d) for d in dirs)):
+        return "config"
+    if ext in _CODE_EXT and stem in ("prod", "production", "prd"):
+        return "config"
+    # possible production: the same places, spelled "pro"
+    if _PRO_ENV.match(name) or ext == ".pro":
+        return "possible"
+    if config_like and (_PRO_IN_NAME.search(lname) or any(_PRO_DIR.match(d) for d in dirs)):
+        return "possible"
+    if ext in _CODE_EXT and stem == "pro":
+        return "possible"
+    return None
 
 
 def is_production(rel: str, text: str) -> bool:

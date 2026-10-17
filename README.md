@@ -52,6 +52,40 @@ prescan protect .env --agent bob          # let the agent's own ignore rules cov
 prescan allow 3fa9c2e1 --reason "..."     # mark one finding (id from the report) as safe
 ```
 
+## Production files always block
+
+Production configuration doesn't belong where an agent can read it, and production secrets don't
+belong in a repo at all. A file whose **path** says production always blocks:
+
+| Rule | Files |
+|---|---|
+| `production-env-file` | `.env.prod`, `.env.production(.local)`, `.env.prd`, `prod.env`, `*.prod.env` |
+| `production-file` | config / infra / script files with `prod`, `production` or `prd` as a word in the name (`values-prod.yaml`, `values_prod.yaml`, `appsettings.Production.json`, `docker-compose.prod.yml`, `Dockerfile.prod`, `deploy-prod.yml`, `prod.tfvars`, `kubeconfig-prod`) or as the extension (`values.prod`, `config.prd`), anything under a production folder (`overlays/production/`, `envs/prod/`, `k8s/prod-eu/`), and settings code named after it (`settings/prod.py`, `environments/production.rb`) |
+
+Matching ignores case: `VALUES_PROD.YAML`, `.ENV.PROD`, `overlays/PRODUCTION/` and
+`environment: PRODUCTION` all count.
+
+**Possible production files.** `pro` is also used for production, but just as often for a pricing
+tier or a Qt project file. The same places spelled `pro` (`values_pro.yaml`, `values.pro`,
+`.env.pro`, `envs/PRO/`) give `possible-production-file`. These block (medium) but, unlike the files
+above, the team decides: if it isn't production, `prescan allow <file> --reason "…"` (or `protect`)
+clears it.
+
+Not production: templates and examples (`.env.prod.example`, anything under `examples/`), docs, and
+words that only contain the letters (`products.yaml`). A file that merely *mentions* production
+(`environment: production`, `ENV NODE_ENV=production`) doesn't block by itself; its medium findings
+are raised to high instead.
+
+These findings **can't be cleared by the repo or the agent**: `allow`, `protect` and `baseline`
+refuse them, and the agent's ignore rules don't make them "covered". The report says to remove the
+file and checks git:
+- **committed:** deleting it isn't enough, because it stays in history and on any remote. Rotate the values.
+- **no longer tracked but in history:** same, rotate the values.
+- **not committed:** delete it or move it out of the project directory.
+
+The only override is deliberate and central, in your own config: `exclude` for a path, or
+`disable_rules = ["production-file"]`.
+
 ## When prescan blocks: two fixes that don't delete anything
 
 Deleting secrets every time you want to ask the agent something isn't workable, so every block
@@ -315,7 +349,7 @@ keywords = ["ClientCo"]
 | Situation | Fix |
 |---|---|
 | One line is fine | add a comment containing `prescan:ignore` on that line |
-| A file holds real secrets but must stay | `prescan protect <file> --agent <agent>`: the agent's own ignore rules cover it |
+| A file holds real secrets but must stay | `prescan protect <file> --agent <agent>`: the agent's own ignore rules cover it (not for production files: remove those) |
 | A finding is a false positive / safe to share | `prescan allow <id or file> --reason "…"` |
 | A file / directory should never be scanned | `exclude = ["path/"]` in that project's `[[project]]` entry (or top-level for all projects) |
 | A known-safe value (e.g. publishable key) | `allow_values = ["^pk_live_"]` |

@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import subprocess
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -47,6 +48,8 @@ class Finding:
     fingerprint: str
     blocking: bool = True
     covered_by: str | None = None   # set when the launched agent is configured not to read this file
+    # Production files: always block. No baseline, `allow`, `protect` or agent ignore rule clears them.
+    unresolvable: bool = False
 
     @property
     def short_id(self) -> str:
@@ -189,6 +192,7 @@ class Scanner:
             except OSError:
                 size = 0
             findings += self._file_rule_findings(rel, size)
+            findings += self._production_findings(rel)
             if rel == CONFIG_NAME and self.cfg.trust_project_config:
                 # prescan's own config lists the very names it blocks; don't flag it against itself.
                 findings += self._config_exposure_findings(full)
@@ -218,8 +222,14 @@ class Scanner:
 
         findings = self._dedupe(findings)
         baseline = self._load_baseline()
-        kept = [f for f in findings if f.fingerprint not in baseline]
+        prod_paths = {f.path for f in findings if f.unresolvable}
+        # A production env file is more than an env file: drop the generic `env-file` finding for it.
+        findings = [f for f in findings if not (f.rule_id == "env-file" and f.path in prod_paths)]
+        kept = [f for f in findings if f.unresolvable or f.fingerprint not in baseline]
         for f in kept:
+            if f.unresolvable:
+                f.blocking = True
+                continue
             if self.coverage and f.category != "config" and self.coverage.covers(f.path):
                 f.covered_by = self.coverage.label
                 f.blocking = False
@@ -250,6 +260,42 @@ class Scanner:
         return data.decode("utf-8", errors="replace")
 
     # -- file-name rules ---------------------------------------------------- #
+    def _production_findings(self, rel: str) -> list[Finding]:
+        kind = C.production_kind(rel)
+        rule_id = {"env": "production-env-file", "config": "production-file",
+                   "possible": "possible-production-file"}.get(kind or "")
+        if not rule_id or rule_id in self.cfg.disable_rules:
+            return []
+        if kind == "possible":
+            # "pro" may mean production, or a pricing tier, a Qt project...: block, but let the team decide.
+            return [Finding(
+                rule_id=rule_id, category="production", severity=R.MEDIUM,
+                description="Possibly a production file ('pro' in the path): if it is, remove it from the repo; "
+                            "if not, mark it safe with `prescan allow`",
+                path=rel, line=0, column=0, redacted="", snippet="",
+                fingerprint=fingerprint(rule_id, rel, ""),
+            )]
+        desc = ("Production environment file: production secrets don't belong in a repo, remove it"
+                if kind == "env" else
+                "Production file: production configuration must not be within the agent's reach, remove it from the repo")
+        return [Finding(
+            rule_id=rule_id, category="production", severity=R.HIGH, description=desc, path=rel, line=0,
+            column=0, redacted="", snippet=self._git_note(rel), fingerprint=fingerprint(rule_id, rel, ""),
+            unresolvable=True,
+        )]
+
+    def _git_note(self, rel: str) -> str:
+        """Deleting a committed file doesn't remove it from history (or from a remote it was pushed to)."""
+        if not hasattr(self, "_in_git"):
+            self._in_git = _git(self.root, "rev-parse", "--is-inside-work-tree") == "true"
+        if not self._in_git:
+            return "Not in a git repo: delete it or move it out of the project directory."
+        if _git(self.root, "ls-files", "--", rel):
+            return "Committed to git: deleting it isn't enough, it stays in history and on any remote. Rotate these values."
+        if _git(self.root, "log", "--all", "--format=%h", "-1", "--", rel):
+            return "No longer tracked, but still in git history (and any remote it was pushed to). Rotate these values."
+        return "Not committed: delete it or move it out of the project directory."
+
     def _symlink_findings(self) -> list[Finding]:
         """A link to a file outside the repo is invisible to prescan but readable by the agent."""
         out = []
@@ -527,6 +573,14 @@ class Scanner:
                 continue
             out |= {e["fingerprint"] for e in data.get("accepted", []) if "fingerprint" in e}
         return out
+
+
+def _git(root: Path, *args: str) -> str:
+    try:
+        p = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return p.stdout.strip() if p.returncode == 0 else ""
 
 
 def write_baseline(root: Path, findings: list[Finding], reason: str | None = None) -> Path:

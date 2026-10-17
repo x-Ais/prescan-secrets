@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import context as C
 from .agents import AGENTS, PROTECTABLE, ProtectError, agent_for_command, protect
 from .config import CONFIG_NAME, ConfigError, central_config_path, load_config, prescan_home
 from .report import render_json, render_text
@@ -70,13 +71,22 @@ def cmd_scan(args) -> int:
     return EXIT_OK if result.ok else EXIT_BLOCKED
 
 
+def _production_paths(result: ScanResult) -> set[str]:
+    return {f.path for f in result.findings if f.unresolvable}
+
+
 def cmd_baseline(args) -> int:
     result = _scan(args.path, args)
-    if not result.findings:
-        print("Nothing to accept — scan is clean.", file=sys.stderr)
-        return EXIT_OK
-    p = write_baseline(Path(args.path), result.findings)
-    print(f"Accepted {len(result.findings)} finding(s) into {p}", file=sys.stderr)
+    prod = _production_paths(result)
+    accept = [f for f in result.findings if f.path not in prod]
+    if prod:
+        print(f"Not accepted (production files always block, remove them): {', '.join(sorted(prod))}",
+              file=sys.stderr)
+    if not accept:
+        print("Nothing to accept.", file=sys.stderr)
+        return EXIT_OK if not prod else EXIT_BLOCKED
+    p = write_baseline(Path(args.path), accept)
+    print(f"Accepted {len(accept)} finding(s) into {p}", file=sys.stderr)
     print("New findings will still block. Delete that file to undo.", file=sys.stderr)
     return EXIT_OK
 
@@ -101,6 +111,14 @@ def _rel_paths(root: Path, paths: list[str]) -> list[str]:
 def cmd_protect(args) -> int:
     root = Path(args.path).expanduser().resolve()
     rels = _rel_paths(root, args.files)
+    definite = ("env", "config")  # "possible" production files can be protected like any other
+    prod = sorted({r for r in rels if C.production_kind(r) in definite} | {
+        f.relative_to(root).as_posix() for r in rels if (root / r).is_dir()
+        for f in (root / r).rglob("*") if f.is_file() and C.production_kind(f.relative_to(root).as_posix()) in definite})
+    if prod:
+        print("prescan protect: production files can't be protected away, they always block. "
+              f"Remove them from the repo: {', '.join(prod)}", file=sys.stderr)
+        return EXIT_ERROR
     try:
         target, added = protect(args.agent, root, rels, scope=args.scope)
     except ProtectError as e:
@@ -138,6 +156,10 @@ def cmd_allow(args) -> int:
         chosen += hits if hits else []
         if not hits:
             problems.append(f"{sel}: no current findings in this path")
+    prod = sorted(_production_paths(result) & {f.path for f in chosen})
+    if prod:
+        problems.append("production files can't be marked safe, they always block. Remove them from the repo: "
+                        + ", ".join(prod))
     if problems:
         for p in problems:
             print(f"prescan allow: {p}", file=sys.stderr)

@@ -128,8 +128,8 @@ class TestSecrets(unittest.TestCase):
 class TestFiles(unittest.TestCase):
     def test_env_files(self):
         r = scan({".env": "A=1\n", "svc/.env.production": "A=1\n", ".env.example": "A=\n"})
-        flagged = {f.path for f in r.findings if f.rule_id == "env-file"}
-        self.assertEqual(flagged, {".env", "svc/.env.production"})
+        self.assertEqual({(f.path, f.rule_id) for f in r.findings},
+                         {(".env", "env-file"), ("svc/.env.production", "production-env-file")})
 
     def test_key_and_state_files(self):
         r = scan({"certs/server.key": "x", "infra/terraform.tfstate": "{}", ".aws/credentials": "x",
@@ -514,7 +514,7 @@ class TestPhase1(unittest.TestCase):
 
     def test_enterprise_credential_files(self):
         names = ["svc.keytab", "key.kdb", "key.sth", "wallet/cwallet.sso", ".pypirc", "trace.har",
-                 "prod.postman_environment.json", ".vault_pass", "ansible/vault-password.txt"]
+                 "team.postman_environment.json", ".vault_pass", "ansible/vault-password.txt"]
         r = scan({n: "x" for n in names} | {"tnsnames.ora": "x", "heap.hprof": "x", "core.1234": "x", "core.js": "x"})
         self.assertEqual({f.path for f in r.findings if f.rule_id == "credentials-file"}, set(names))
         self.assertEqual({(f.path, f.rule_id) for f in r.findings if f.rule_id != "credentials-file"},
@@ -845,9 +845,9 @@ class TestFixes(unittest.TestCase):
         self.assertEqual({f.rule_id for f in Scanner(root, Config()).scan().blocking}, {"github-token"})
 
     def test_allow_file_is_exact(self):
-        root = make_repo({".env": "A=1\n", ".env.prod": "A=1\n", "certs/a.key": "x", "certs2/b.key": "x"})
+        root = make_repo({".env": "A=1\n", ".env.local": "A=1\n", "certs/a.key": "x", "certs2/b.key": "x"})
         self.assertEqual(self.run_cli("allow", str(root / ".env"), str(root / "certs"), "--path", str(root))[0], 0)
-        self.assertEqual({f.path for f in Scanner(root, Config()).scan().blocking}, {".env.prod", "certs2/b.key"})
+        self.assertEqual({f.path for f in Scanner(root, Config()).scan().blocking}, {".env.local", "certs2/b.key"})
 
     def test_allow_rejects_unknown_ids_and_paths(self):
         root = self.repo()
@@ -868,6 +868,131 @@ class TestFixes(unittest.TestCase):
         self.assertIn("Not available: Codex", render_text(Scanner(root, Config(), agent="codex").scan(), color=False))
         self.assertIn("--agent <claude-code|bob|gemini>", render_text(Scanner(root, Config()).scan(), color=False))
         self.assertIn("permissions.deny", render_text(Scanner(root, Config(), agent="claude-code").scan(), color=False))
+
+
+class TestProductionFiles(unittest.TestCase):
+    def test_classification(self):
+        from prescan.context import production_kind as kind
+        env = [".env.prod", ".env.production.local", ".env.prd", "prod.env", "api.prod.env"]
+        config = ["chart/values-prod.yaml", "chart/values_prod.yaml", "appsettings.Production.json",
+                  "docker-compose.prod.yml", "Dockerfile.prod", ".github/workflows/deploy-prod.yml",
+                  "infra/prod.tfvars", "kubeconfig-prod", "k8s/overlays/production/kustomization.yaml",
+                  "envs/prod/main.tf", "k8s/prod-eu/deploy.yaml", "charts/prod/templates/deploy.yaml",
+                  "settings/prod.py", "config/environments/production.rb"]
+        neither = [".env.prod.example", "values-prod.example.yaml", "examples/prod/values.yaml", "products.yaml",
+                   "src/product/views.py", "docs/production-notes.md", "overlays/production/README.md",
+                   "src/prod/handler.py", ".env", "values.yaml", "reproduce.yaml"]
+        self.assertEqual({p: kind(p) for p in env}, {p: "env" for p in env})
+        self.assertEqual({p: kind(p) for p in config}, {p: "config" for p in config})
+        self.assertEqual({p: kind(p) for p in neither}, {p: None for p in neither})
+
+    def test_capitals_and_extension_spellings(self):
+        from prescan.context import production_kind as kind
+        definite = ["VALUES_PROD.YAML", "Values-Prod.yaml", ".ENV.PROD", "PROD.env", "overlays/PRODUCTION/x.yaml",
+                    "envs/Prod/main.tf", "Dockerfile.PROD", "deploy-PRD.yml", "settings/PROD.py",
+                    "values.prod", "values.PROD", "config.prd", "app.production"]
+        self.assertEqual({p: bool(kind(p)) and kind(p) != "possible" for p in definite}, {p: True for p in definite})
+
+    def test_possible_production(self):
+        from prescan.context import production_kind as kind
+        possible = ["values_pro.yaml", "values-PRO.yaml", "values.pro", ".env.pro", "PRO.env", "envs/PRO/main.tf",
+                    "settings/pro.py"]
+        neither = ["protocol.yaml", "pros.yaml", "improve.yaml", "src/pro/handler.py", "values-pro.example.yaml"]
+        self.assertEqual({p: kind(p) for p in possible}, {p: "possible" for p in possible})
+        self.assertEqual({p: kind(p) for p in neither}, {p: None for p in neither})
+
+    def test_possible_production_blocks_but_can_be_allowed_or_protected(self):
+        root = make_repo({"chart/values_pro.yaml": "replicas: 3\n", "envs/PRO/main.tf": "x = 1\n"})
+        r = Scanner(root, Config()).scan()
+        self.assertEqual(sorted((f.path, f.rule_id, f.severity, f.unresolvable) for f in r.blocking),
+                         [("chart/values_pro.yaml", "possible-production-file", "medium", False),
+                          ("envs/PRO/main.tf", "possible-production-file", "medium", False)])
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(main(["allow", str(root / "chart" / "values_pro.yaml"), "--reason", "pricing tier",
+                                   "--path", str(root)]), 0)
+            self.assertEqual(main(["protect", str(root / "envs" / "PRO"), "--agent", "bob", "--path", str(root)]), 0)
+        r = Scanner(root, Config(), agent="bob").scan()
+        self.assertTrue(r.ok)
+        self.assertEqual([f.path for f in r.covered], ["envs/PRO/main.tf"])
+
+    def test_content_mentions_escalate_case_insensitively(self):
+        for env in ("PRODUCTION", "Prod", "PRD", "pro"):
+            r = scan({".github/workflows/x.yml": f"environment: {env}\nhost: http://10.1.2.3\n"})
+            ip = next(f for f in r.findings if f.rule_id == "private-ip")
+            self.assertEqual(ip.severity, "high", env)
+
+    def test_always_blocks_even_when_covered_baselined_or_fail_on_high(self):
+        from prescan.scanner import fingerprint
+        root = make_repo({".env.prod": "A=1\n", "chart/values_prod.yaml": "replicas: 3\n",
+                          ".bobignore": "/.env.prod\n/chart/\n"})
+        from prescan.config import baseline_path
+        baseline_path(root).parent.mkdir(parents=True, exist_ok=True)
+        baseline_path(root).write_text(json.dumps({"accepted": [
+            {"fingerprint": fingerprint("production-env-file", ".env.prod", "")},
+            {"fingerprint": fingerprint("production-file", "chart/values_prod.yaml", "")}]}))
+        r = Scanner(root, Config(fail_on="high"), agent="bob").scan()
+        self.assertEqual(sorted((f.path, f.rule_id) for f in r.blocking),
+                         [(".env.prod", "production-env-file"), ("chart/values_prod.yaml", "production-file")])
+        self.assertEqual(r.covered, [])
+        self.assertNotIn("env-file", ids(r))  # the production finding replaces the generic one
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_git_history_note(self):
+        root = make_repo({".env.prod": "A=1\n", "old/.env.production": "A=1\n", "new/values-prod.yaml": "a: 1\n"})
+        git = ["git", "-c", "user.name=Ais", "-c", "user.email=", "-C", str(root)]
+        subprocess.run(git[:5] + ["init", "-q"], cwd=root, check=True)
+        subprocess.run(git + ["add", ".env.prod", "old/.env.production"], check=True)
+        subprocess.run(git + ["commit", "-qm", "x"], check=True)
+        subprocess.run(git + ["rm", "-q", "--cached", "old/.env.production"], check=True)
+        subprocess.run(git + ["commit", "-qm", "y"], check=True)
+        notes = {f.path: f.snippet for f in Scanner(root, Config()).scan().findings if f.unresolvable}
+        self.assertIn("Committed to git", notes[".env.prod"])
+        self.assertIn("still in git history", notes["old/.env.production"])
+        self.assertIn("Not committed", notes["new/values-prod.yaml"])
+        no_git = make_repo({".env.prod": "A=1\n"})
+        self.assertIn("Not in a git repo", Scanner(no_git, Config()).scan().findings[0].snippet)
+
+    def run_cli(self, *argv):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(list(argv))
+        return code, err.getvalue()
+
+    def test_allow_protect_baseline_refuse_production(self):
+        from prescan.config import baseline_path
+        root = make_repo({".env.prod": "A=1\n", "chart/values_prod.yaml": "a: 1\n", "app.py": f'K = "{GH}"\n'})
+        code, out = self.run_cli("allow", str(root / ".env.prod"), "--path", str(root))
+        self.assertEqual((code, "can't be marked safe" in out), (2, True))
+        prod_id = next(f.short_id for f in Scanner(root, Config()).scan().findings if f.path == ".env.prod")
+        self.assertEqual(self.run_cli("allow", prod_id, "--path", str(root))[0], 2)
+        self.assertFalse(baseline_path(root).exists())
+        code, out = self.run_cli("protect", str(root / "chart"), "--agent", "bob", "--path", str(root))
+        self.assertEqual((code, "chart/values_prod.yaml" in out), (2, True))
+        self.assertFalse((root / ".bobignore").exists())
+        code, out = self.run_cli("baseline", str(root))
+        self.assertIn("Not accepted", out)
+        accepted = {e["path"] for e in json.loads(baseline_path(root).read_text())["accepted"]}
+        self.assertEqual(accepted, {"app.py"})  # production entries are never recorded as accepted
+        self.assertEqual({f.path for f in Scanner(root, Config()).scan().blocking}, {".env.prod", "chart/values_prod.yaml"})
+
+    def test_report_gives_remove_only_advice(self):
+        from prescan.report import render_text
+        root = make_repo({".env.prod": "A=1\n", "app.py": f'K = "{GH}"\n'})
+        text = render_text(Scanner(root, Config(), agent="bob").scan(), color=False)
+        self.assertIn("Production files always block", text)
+        self.assertIn("protect app.py --agent bob", text)
+        self.assertNotIn("protect .env.prod", text)
+        only_prod = render_text(Scanner(make_repo({".env.prod": "A=1\n"}), Config(), agent="bob").scan(), color=False)
+        self.assertNotIn("How to resolve the other findings", only_prod)
+
+    def test_central_config_is_the_only_escape_hatch(self):
+        root = make_repo({"deploy/values-prod.yaml": "a: 1\n"})
+        self.assertFalse(Scanner(root, Config()).scan().ok)
+        cfg = load_config(root, central(f'[[project]]\npath = "{root}"\nexclude = ["deploy/values-prod.yaml"]\n'))
+        self.assertTrue(Scanner(root, cfg).scan().ok)
+        cfg = load_config(root, central('disable_rules = ["production-file"]\n'))
+        self.assertTrue(Scanner(root, cfg).scan().ok)
 
 
 class TestCli(unittest.TestCase):
