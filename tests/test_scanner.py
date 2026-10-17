@@ -754,6 +754,122 @@ USER app
         self.assertEqual(ids(r), {"generic-secret-assignment"})
 
 
+class TestFixes(unittest.TestCase):
+    """The two ways out of a block: `protect` (agent ignore rules) and `allow` (safe / false positive)."""
+
+    def repo(self):
+        return make_repo({".env": f"AWS_ACCESS_KEY_ID={AWS_ID}\n", "src/app.py": f'K = "{GH}"\n',
+                          "certs/a.key": "x", "certs/b.key": "x"})
+
+    def run_cli(self, *argv):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(list(argv))
+        return code, err.getvalue()
+
+    def test_protect_bob(self):
+        root = self.repo()
+        code, out = self.run_cli("protect", str(root / ".env"), str(root / "certs"), "--agent", "bob",
+                                 "--path", str(root))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((root / ".bobignore").read_text().splitlines()[1:], ["/.env", "/certs/"])
+        r = Scanner(root, Config(), agent="bob").scan()
+        self.assertEqual({f.path for f in r.covered}, {".env", "certs/a.key", "certs/b.key"})
+        self.assertEqual({f.path for f in r.blocking}, {"src/app.py"})
+        code, out = self.run_cli("protect", str(root / ".env"), "--agent", "bob", "--path", str(root))
+        self.assertIn("Already covered", out)  # idempotent
+        self.assertEqual((root / ".bobignore").read_text().count("/.env"), 1)
+
+    def test_protect_escapes_glob_characters(self):
+        root = make_repo({"a[1].env": "A=1\n", "a1.env": "A=1\n"})
+        self.assertEqual(self.run_cli("protect", str(root / "a[1].env"), "--agent", "gemini", "--path", str(root))[0], 0)
+        r = Scanner(root, Config(), agent="gemini").scan()
+        self.assertEqual(({f.path for f in r.covered}, {f.path for f in r.blocking}), ({"a[1].env"}, {"a1.env"}))
+
+    def test_protect_claude(self):
+        root = self.repo()
+        (root / ".claude").mkdir()
+        (root / ".claude" / "settings.json").write_text(json.dumps({"model": "x", "permissions": {"allow": ["Bash(ls)"]}}))
+        self.assertEqual(self.run_cli("protect", str(root / ".env"), str(root / "certs"), "--agent", "claude-code",
+                                      "--path", str(root))[0], 0)
+        data = json.loads((root / ".claude" / "settings.json").read_text())
+        self.assertEqual((data["model"], data["permissions"]["allow"], data["permissions"]["deny"]),
+                         ("x", ["Bash(ls)"], ["Read(./.env)", "Read(./certs/**)"]))
+        self.assertEqual({f.path for f in Scanner(root, Config(), agent="claude-code").scan().blocking}, {"src/app.py"})
+        self.run_cli("protect", str(root / "src" / "app.py"), "--agent", "claude-code", "--scope", "local",
+                     "--path", str(root))
+        self.assertEqual(json.loads((root / ".claude" / "settings.local.json").read_text())["permissions"]["deny"],
+                         ["Read(./src/app.py)"])
+        self.assertTrue(Scanner(root, Config(), agent="claude-code").scan().ok)
+
+    def test_protect_refusals(self):
+        root = self.repo()
+        for argv, msg in [
+            (("protect", str(root / ".env"), "--agent", "codex"), "invalid choice"),
+            (("protect", str(root / "nope.txt"), "--agent", "bob"), "no such file"),
+            (("protect", str(Path(tempfile.mkdtemp())), "--agent", "bob"), "outside the project"),
+            (("protect", str(root), "--agent", "bob"), "whole project"),
+        ]:
+            with redirect_stderr(io.StringIO()) as err:
+                try:
+                    code = main([*argv, "--path", str(root)])
+                except SystemExit as e:  # argparse rejects unknown agents
+                    code = e.code
+            self.assertEqual(code, 2, argv)
+            self.assertIn(msg, err.getvalue(), argv)
+        self.assertFalse((root / ".bobignore").exists())
+
+    def test_protect_fails_loudly_if_not_covered_afterwards(self):
+        from unittest import mock
+        from prescan.agents import ProtectError, protect
+        root = self.repo()
+        with mock.patch("prescan.agents.coverage_for", return_value=None):
+            with self.assertRaises(ProtectError) as cm:
+                protect("bob", root, [".env"])
+        self.assertIn("still doesn't see these as covered", str(cm.exception))
+
+    def test_allow_by_id_and_by_file(self):
+        root = self.repo()
+        r = Scanner(root, Config()).scan()
+        gh = next(f for f in r.findings if f.rule_id == "github-token")
+        code, out = self.run_cli("allow", gh.short_id, "--reason", "fake fixture", "--path", str(root))
+        self.assertEqual(code, 0, out)
+        code, out = self.run_cli("allow", str(root / ".env"), str(root / "certs"), "--path", str(root))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(Scanner(root, Config()).scan().ok)
+        from prescan.config import baseline_path
+        entries = json.loads(baseline_path(root).read_text())["accepted"]
+        self.assertEqual(next(e for e in entries if e["fingerprint"] == gh.fingerprint)["reason"], "fake fixture")
+        self.assertNotIn(GH, baseline_path(root).read_text())  # fingerprints only, never values
+        (root / ".env").write_text(f"AWS_ACCESS_KEY_ID={AWS_ID}\nTOKEN={J(['ghp_', 'Zz' * 18])}\n")
+        self.assertEqual({f.rule_id for f in Scanner(root, Config()).scan().blocking}, {"github-token"})
+
+    def test_allow_file_is_exact(self):
+        root = make_repo({".env": "A=1\n", ".env.prod": "A=1\n", "certs/a.key": "x", "certs2/b.key": "x"})
+        self.assertEqual(self.run_cli("allow", str(root / ".env"), str(root / "certs"), "--path", str(root))[0], 0)
+        self.assertEqual({f.path for f in Scanner(root, Config()).scan().blocking}, {".env.prod", "certs2/b.key"})
+
+    def test_allow_rejects_unknown_ids_and_paths(self):
+        root = self.repo()
+        for sel, msg in (("deadbeef", "no current finding"), (str(root / "missing.txt"), "no such file")):
+            code, out = self.run_cli("allow", sel, "--path", str(root))
+            self.assertEqual(code, 2)
+            self.assertIn(msg, out)
+
+    def test_report_suggests_both_fixes_for_the_agent(self):
+        from prescan.report import render_text
+        root = self.repo()
+        bob = render_text(Scanner(root, Config(), agent="bob").scan(), color=False)
+        self.assertIn("protect .env certs/a.key certs/b.key src/app.py --agent bob", bob)
+        self.assertIn("Adds them to .bobignore", bob)
+        ids = [f.short_id for f in Scanner(root, Config(), agent="bob").scan().blocking]
+        self.assertIn("allow " + " ".join(ids), bob)
+        self.assertIn(f"id {ids[0]}", bob)
+        self.assertIn("Not available: Codex", render_text(Scanner(root, Config(), agent="codex").scan(), color=False))
+        self.assertIn("--agent <claude-code|bob|gemini>", render_text(Scanner(root, Config()).scan(), color=False))
+        self.assertIn("permissions.deny", render_text(Scanner(root, Config(), agent="claude-code").scan(), color=False))
+
+
 class TestCli(unittest.TestCase):
     def _run(self, *args, stdin=""):
         return subprocess.run([sys.executable, "-m", "prescan", *args], cwd=ROOT, input=stdin,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import datetime
 import fnmatch
 import hashlib
 import ipaddress
@@ -47,8 +48,13 @@ class Finding:
     blocking: bool = True
     covered_by: str | None = None   # set when the launched agent is configured not to read this file
 
+    @property
+    def short_id(self) -> str:
+        """Short handle shown in reports and accepted by `prescan allow`."""
+        return self.fingerprint[:8]
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        return asdict(self) | {"id": self.short_id}
 
 
 @dataclass
@@ -523,7 +529,7 @@ class Scanner:
         return out
 
 
-def write_baseline(root: Path, findings: list[Finding]) -> Path:
+def write_baseline(root: Path, findings: list[Finding], reason: str | None = None) -> Path:
     p = baseline_path(root)
     p.parent.mkdir(parents=True, exist_ok=True)
     existing = {}
@@ -534,9 +540,11 @@ def write_baseline(root: Path, findings: list[Finding]) -> Path:
         except (OSError, json.JSONDecodeError, KeyError):
             pass
     for f in findings:
-        existing[f.fingerprint] = {
-            "fingerprint": f.fingerprint, "rule_id": f.rule_id, "path": f.path, "line": f.line,
-        }
+        entry = {"fingerprint": f.fingerprint, "rule_id": f.rule_id, "path": f.path, "line": f.line,
+                 "accepted": datetime.date.today().isoformat()}
+        if reason:
+            entry["reason"] = reason
+        existing[f.fingerprint] = entry
     p.write_text(json.dumps({"project": str(root.resolve()),
                              "accepted": sorted(existing.values(), key=lambda e: (e["path"], e["line"]))},
                             indent=2) + "\n", encoding="utf-8")

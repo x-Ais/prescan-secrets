@@ -4,16 +4,60 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import shutil
 import sys
 from itertools import groupby
+from pathlib import Path
 
+from .agents import PROTECTABLE
 from .scanner import ScanResult
+
+_AGENT_NAMES = {"claude-code": "Claude Code", "bob": "IBM Bob", "gemini": "Gemini CLI", "codex": "Codex",
+                "aider": "Aider"}
 
 _COLORS = {"high": "31;1", "medium": "33;1", "low": "36", "ok": "32;1", "dim": "2", "bold": "1"}
 
 
 def _use_color(stream) -> bool:
     return hasattr(stream, "isatty") and stream.isatty() and not os.environ.get("NO_COLOR")
+
+
+def self_command() -> str:
+    """How the user can call prescan from where they are (hooks may run without it on PATH)."""
+    return "prescan" if shutil.which("prescan") else f"{shlex.quote(sys.executable)} -m prescan"
+
+
+def _fix_suggestions(result: ScanResult) -> list[str]:
+    """The two ways out of a block, as commands ready to copy for the launched agent."""
+    cmd = self_command()
+    try:
+        here = Path.cwd().resolve() == Path(result.root)
+    except OSError:
+        here = False
+    at = "" if here else f" --path {shlex.quote(result.root)}"
+    blocking = [f for f in result.blocking]
+    files = sorted({f.path for f in blocking if f.category != "config"})
+    ids = [f.short_id for f in blocking]
+    shown_ids = " ".join(ids[:8]) + (" …" if len(ids) > 8 else "")
+    quoted = " ".join(shlex.quote(p) for p in files[:8]) + (" …" if len(files) > 8 else "")
+    agent = result.agent
+    out = ["", "How to resolve, without deleting anything (pick one per file):", ""]
+    out.append("  1. Keep it away from the agent: the file stays, the agent can't read it, prescan stops blocking.")
+    if agent in PROTECTABLE:
+        out.append(f"       {cmd} protect {quoted} --agent {agent}{at}")
+        where = "Claude Code permissions.deny (.claude/settings.json)" if agent == "claude-code" else PROTECTABLE[agent]
+        out.append(f"     Adds them to {where}.")
+    elif agent:
+        out.append(f"     Not available: {_AGENT_NAMES.get(agent, agent)} has no ignore file that blocks reads.")
+    else:
+        out.append(f"       {cmd} protect {quoted} --agent <claude-code|bob|gemini>{at}")
+    out += ["", "  2. Mark as safe / false positive: the agent CAN read it, so only for values that are fine to share.",
+            f"       {cmd} allow {shown_ids} --reason \"...\"{at}",
+            f"     Or a whole file: {cmd} allow <file> --reason \"...\". Stored centrally as fingerprints, never values.",
+            "",
+            "  Otherwise remove the secret from the repo, or add `prescan:ignore` on a single false-positive line."]
+    return out
 
 
 def render_text(result: ScanResult, color: bool | None = None, show_snippets: bool = True) -> str:
@@ -45,7 +89,7 @@ def render_text(result: ScanResult, color: bool | None = None, show_snippets: bo
             tag = c(f.severity, f"{f.severity.upper():<6}")
             where = f"L{f.line}" if f.line else "file"
             suffix = "" if f.blocking else c("dim", " (warning)")
-            out.append(f"  {tag} {where:<6} {f.description} [{f.rule_id}]{suffix}")
+            out.append(f"  {tag} {where:<6} {f.description} [{f.rule_id}] {c('dim', 'id ' + f.short_id)}{suffix}")
             if show_snippets and f.snippet:
                 out.append(c("dim", f"         {f.snippet}"))
 
@@ -66,15 +110,7 @@ def render_text(result: ScanResult, color: bool | None = None, show_snippets: bo
     out.append(c("dim", summary))
 
     if not result.ok:
-        out += [
-            "",
-            "How to resolve:",
-            "  • Move secrets out of the repo (secret manager, or a file outside the project dir).",
-            "  • False positive on one line?  add a comment containing  prescan:ignore",
-            "  • Whole file/dir is fine?      add it to `exclude` for this project in the central config",
-            "                                 (prescan init prints where it is)",
-            "  • Accept everything currently flagged:  prescan baseline",
-        ]
+        out += _fix_suggestions(result)
     return "\n".join(out)
 
 

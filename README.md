@@ -48,7 +48,44 @@ prescan --format json       # machine-readable
 prescan --fail-on high      # only high-severity findings block
 prescan --agent bob         # as Bob would see it: files in .bobignore don't block
 prescan baseline            # accept everything currently flagged in this project (new findings still block)
+prescan protect .env --agent bob          # let the agent's own ignore rules cover a file
+prescan allow 3fa9c2e1 --reason "..."     # mark one finding (id from the report) as safe
 ```
+
+## When prescan blocks: two fixes that don't delete anything
+
+Deleting secrets every time you want to ask the agent something isn't workable, so every block
+report ends with two ready-to-copy commands for the agent being launched:
+
+**1. Keep the file away from the agent.** The file stays, the agent can't read it, and prescan
+stops blocking on it, even when the secret inside changes.
+
+```bash
+prescan protect .env config/ --agent bob
+```
+
+| Agent | What `protect` writes |
+|---|---|
+| IBM Bob | `/.env`, `/config/` appended to `.bobignore` |
+| Gemini CLI | same, in `.geminiignore` |
+| Claude Code | `Read(./.env)`, `Read(./config/**)` in `.claude/settings.json` (`--scope local` → `settings.local.json`) |
+| Codex, Aider | not available: no ignore file that blocks reads. Use option 2, or move the secret out. |
+
+Entries are anchored, exact paths (glob characters escaped). After writing, prescan re-checks that
+it really sees each path as covered, and fails if not, so you never get a false sense of safety.
+Commit the ignore file so teammates' agents skip the file too.
+
+**2. Mark it as safe / a false positive.** The agent **can** read it, so this is for test
+fixtures, public endpoints and similar.
+
+```bash
+prescan allow 3fa9c2e1 9b0d1a77 --reason "fake fixture"
+prescan allow tests/fixtures/ --reason "fake data"
+```
+
+IDs are shown next to each finding in the report. Choices are stored in the central baseline
+(`~/.config/prescan/baselines/`) with the reason and date, as fingerprints only, never the values.
+A new or changed secret still blocks.
 
 ## Where everything lives
 
@@ -278,7 +315,9 @@ keywords = ["ClientCo"]
 | Situation | Fix |
 |---|---|
 | One line is fine | add a comment containing `prescan:ignore` on that line |
-| A file / directory is fine | `exclude = ["path/"]` in that project's `[[project]]` entry (or top-level for all projects) |
+| A file holds real secrets but must stay | `prescan protect <file> --agent <agent>`: the agent's own ignore rules cover it |
+| A finding is a false positive / safe to share | `prescan allow <id or file> --reason "…"` |
+| A file / directory should never be scanned | `exclude = ["path/"]` in that project's `[[project]]` entry (or top-level for all projects) |
 | A known-safe value (e.g. publishable key) | `allow_values = ["^pk_live_"]` |
 | A rule is too noisy | `disable_rules = ["jwt"]`, globally or per project |
 | Accept the current state, block only new stuff | `prescan baseline` in that project. Stored in `~/.config/prescan/baselines/` as hashes, never the secrets. Delete the file to undo. |

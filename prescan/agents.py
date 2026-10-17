@@ -149,3 +149,75 @@ def _claude_deny(root: Path) -> Coverage | None:
         return deny_all or gi.is_ignored_everywhere((base + "/" + rel).lstrip("/"), is_dir)
 
     return Coverage("Claude Code permissions.deny", check)
+
+
+# --------------------------------------------------------------------------- #
+# protect: add files to the launched agent's own ignore mechanism
+# --------------------------------------------------------------------------- #
+PROTECTABLE = {"bob": ".bobignore", "gemini": ".geminiignore", "claude-code": "permissions.deny"}
+
+
+class ProtectError(Exception):
+    pass
+
+
+def _gitignore_escape(rel: str) -> str:
+    """Anchored, literal gitignore pattern for exactly this path."""
+    out = re.sub(r"([*?\[\]\\])", r"\\\1", rel)
+    if out.endswith(" "):
+        out = out[:-1] + "\\ "
+    return "/" + out
+
+
+def protect(agent: str, root: Path, rels: list[str], scope: str = "project") -> tuple[Path, list[str]]:
+    """Add `rels` (paths relative to root, files or dirs) to `agent`'s ignore mechanism.
+
+    Returns (file written, entries added). Raises ProtectError if the agent has no enforced
+    mechanism, or if prescan doesn't see a path as covered afterwards: a "protect" that the
+    agent wouldn't honour must fail loudly, not leave a false sense of safety.
+    """
+    root = root.resolve()
+    if agent not in PROTECTABLE:
+        raise ProtectError(f"{agent or 'this agent'} has no ignore mechanism that blocks reads; "
+                           "use `prescan allow` for findings that are safe to share, or remove the secret")
+    entries: list[str] = []
+    if agent in ("bob", "gemini"):
+        target = root / PROTECTABLE[agent]
+        existing = target.read_text(encoding="utf-8").splitlines() if target.is_file() else []
+        current = coverage_for(agent, root)
+        for rel in rels:
+            if current and current.covers(rel, (root / rel).is_dir()):
+                continue
+            entries.append(_gitignore_escape(rel) + ("/" if (root / rel).is_dir() else ""))
+        if entries:
+            text = "\n".join(existing)
+            if text and not text.endswith("\n"):
+                text += "\n"
+            if not existing:
+                text += "# Files the agent must not read (added by prescan protect)\n"
+            target.write_text(text + "\n".join(entries) + "\n", encoding="utf-8")
+    else:  # claude-code: Read(./path) deny rules in the project's settings
+        target = root / ".claude" / ("settings.local.json" if scope == "local" else "settings.json")
+        try:
+            data = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else {}
+        except ValueError as e:
+            raise ProtectError(f"{target} is not valid JSON ({e}); not touching it") from e
+        deny = data.setdefault("permissions", {}).setdefault("deny", [])
+        for rel in rels:
+            if re.search(r"[*?\[\]()\\]", rel):
+                raise ProtectError(f"can't write an exact Claude rule for {rel!r} (glob/paren characters); "
+                                   "add a permissions.deny rule by hand")
+            rule = f"Read(./{rel}/**)" if (root / rel).is_dir() else f"Read(./{rel})"
+            if rule not in deny:
+                deny.append(rule)
+                entries.append(rule)
+        if entries:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    after = coverage_for(agent, root)
+    missing = [r for r in rels if not (after and after.covers(r if not (root / r).is_dir() else r + "/x"))]
+    if missing:
+        raise ProtectError(f"wrote {target}, but prescan still doesn't see these as covered: {', '.join(missing)}. "
+                           "Another rule in that file may re-include them; check it by hand")
+    return target, entries

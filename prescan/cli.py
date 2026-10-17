@@ -2,6 +2,8 @@
 
   prescan [scan] [PATH]          scan, exit 0 = ok, 1 = blocked, 2 = error
   prescan baseline [PATH]        accept everything currently flagged
+  prescan protect FILE... --agent A   add files to agent A's ignore rules (they stop blocking)
+  prescan allow ID|FILE...       mark findings as safe / false positives (central baseline)
   prescan run [--path P] -- CMD  scan, then exec CMD only if the scan is OK
   prescan hook claude-code|bob   UserPromptSubmit hook for Claude Code / IBM Bob (JSON on stdin)
   prescan install-hook           add the hook to Claude Code (or --agent bob) settings
@@ -14,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -21,13 +24,13 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .agents import AGENTS, agent_for_command
+from .agents import AGENTS, PROTECTABLE, ProtectError, agent_for_command, protect
 from .config import CONFIG_NAME, ConfigError, central_config_path, load_config, prescan_home
 from .report import render_json, render_text
 from .scanner import ScanResult, Scanner, write_baseline
 
 EXIT_OK, EXIT_BLOCKED, EXIT_ERROR = 0, 1, 2
-SUBCOMMANDS = {"scan", "baseline", "run", "hook", "install-hook", "init"}
+SUBCOMMANDS = {"scan", "baseline", "protect", "allow", "run", "hook", "install-hook", "init"}
 
 
 def _scan(path: str, args, agent: str | None = None) -> ScanResult:
@@ -75,6 +78,75 @@ def cmd_baseline(args) -> int:
     p = write_baseline(Path(args.path), result.findings)
     print(f"Accepted {len(result.findings)} finding(s) into {p}", file=sys.stderr)
     print("New findings will still block. Delete that file to undo.", file=sys.stderr)
+    return EXIT_OK
+
+
+def _rel_paths(root: Path, paths: list[str]) -> list[str]:
+    """User-typed paths (relative to the current dir, or absolute) -> paths relative to root."""
+    out = []
+    for p in paths:
+        full = (Path(p) if Path(p).is_absolute() else Path.cwd() / p)
+        if not full.exists() and not full.is_symlink():
+            raise ConfigError(f"no such file or directory: {p}")
+        try:
+            rel = full.parent.resolve().joinpath(full.name).relative_to(root)
+        except ValueError:
+            raise ConfigError(f"{p} is outside the project ({root})") from None
+        if str(rel) == ".":
+            raise ConfigError("refusing to protect/allow the whole project; name files or directories")
+        out.append(rel.as_posix())
+    return out
+
+
+def cmd_protect(args) -> int:
+    root = Path(args.path).expanduser().resolve()
+    rels = _rel_paths(root, args.files)
+    try:
+        target, added = protect(args.agent, root, rels, scope=args.scope)
+    except ProtectError as e:
+        print(f"prescan protect: {e}", file=sys.stderr)
+        return EXIT_ERROR
+    if added:
+        print(f"Added to {target}:", file=sys.stderr)
+        for entry in added:
+            print(f"  {entry}", file=sys.stderr)
+    else:
+        print(f"Already covered by {target.name}; nothing to change.", file=sys.stderr)
+    print(f"{args.agent} won't read these files, so findings in them no longer block. Keep {target.name} "
+          "in the repo so teammates' agents skip them too.", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_allow(args) -> int:
+    root = Path(args.path).expanduser().resolve()
+    result = _scan(str(root), args)
+    chosen, problems = [], []
+    for sel in args.selectors:
+        if re.fullmatch(r"[0-9a-f]{6,20}", sel) and not (Path.cwd() / sel).exists():
+            hits = {f.fingerprint: f for f in result.findings if f.fingerprint.startswith(sel)}
+            if len(hits) == 1:
+                chosen += hits.values()
+            else:
+                problems.append(f"{sel}: {'ambiguous, use more characters' if hits else 'no current finding with this id'}")
+            continue
+        try:
+            rel = _rel_paths(root, [sel])[0]
+        except ConfigError as e:
+            problems.append(str(e))
+            continue
+        hits = [f for f in result.findings if f.path == rel or f.path.startswith(rel + "/")]
+        chosen += hits if hits else []
+        if not hits:
+            problems.append(f"{sel}: no current findings in this path")
+    if problems:
+        for p in problems:
+            print(f"prescan allow: {p}", file=sys.stderr)
+        return EXIT_ERROR
+    p = write_baseline(root, chosen, reason=args.reason)
+    print(f"Marked {len(chosen)} finding(s) as safe in {p}", file=sys.stderr)
+    for f in chosen:
+        print(f"  {f.short_id}  {f.path}{':' + str(f.line) if f.line else ''}  {f.rule_id}", file=sys.stderr)
+    print("The agent can read these. A new or changed secret will still block.", file=sys.stderr)
     return EXIT_OK
 
 
@@ -368,6 +440,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("path", nargs="?", default=".")
     _add_scan_opts(p)
     p.set_defaults(func=cmd_baseline)
+
+    p = sub.add_parser("protect", help="add files to an agent's ignore rules so findings in them stop blocking")
+    p.add_argument("files", nargs="+", metavar="FILE")
+    p.add_argument("--agent", required=True, choices=tuple(PROTECTABLE),
+                   help="bob -> .bobignore, gemini -> .geminiignore, claude-code -> permissions.deny")
+    p.add_argument("--scope", choices=["project", "local"], default="project",
+                   help="claude-code only: .claude/settings.json (project, shared) or settings.local.json (local)")
+    p.add_argument("--path", default=".", help="project root (default: current directory)")
+    p.set_defaults(func=cmd_protect)
+
+    p = sub.add_parser("allow", help="mark findings as safe / false positives (by id from the report, or by file)")
+    p.add_argument("selectors", nargs="+", metavar="ID_OR_FILE")
+    p.add_argument("--reason", help="why this is safe (stored with the baseline entry)")
+    p.add_argument("--path", default=".", help="project root (default: current directory)")
+    _add_scan_opts(p)
+    p.set_defaults(func=cmd_allow)
 
     p = sub.add_parser("run", help="scan, then run the agent only if OK:  prescan run -- claude")
     p.add_argument("--path", default=".")
