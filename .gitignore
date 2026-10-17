@@ -1,0 +1,9 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Personal notes, never committed
+PLAN.md
+HANDOVER.md

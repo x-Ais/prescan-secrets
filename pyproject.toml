@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prescan"
+version = "0.1.0"
+description = "Check a codebase for secrets, credentials and internal URLs before an AI agent reads it."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+prescan = "prescan.cli:main"
+
+[tool.setuptools]
+packages = ["prescan"]
